@@ -9,6 +9,10 @@ jobs:
     name: External Network E2E
     timeout-minutes: 30
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        globalnet: ['', 'globalnet']
     steps:
       - name: Check out the repository
         uses: actions/checkout@v2
@@ -18,3 +22,4 @@ jobs:
         with:
           plugin: '/go/src/github.com/submariner-io/submariner/scripts/e2e/external/hook'
           testdir: 'test/external'
+          using: ${{ matrix.globalnet }}

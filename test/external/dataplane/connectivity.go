@@ -25,6 +25,7 @@ import (
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 	"github.com/submariner-io/shipyard/test/e2e/framework"
+	"github.com/submariner-io/submariner/pkg/globalnet/constants"
 )
 
 const (
@@ -43,7 +44,11 @@ var _ = Describe("[external-dataplane] Connectivity", func() {
 	f := framework.NewFramework("ext-dataplane")
 
 	It("should be able to connect from an external app to a pod in a cluster", func() {
-		testExternalConnectivity(f)
+		if framework.TestContext.GlobalnetEnabled {
+			testGlobalNetExternalConnectivity(f)
+		} else {
+			testExternalConnectivity(f)
+		}
 	})
 })
 
@@ -105,6 +110,59 @@ func testExternalConnectivity(f *framework.Framework) {
 		if clusterName != externalClusterName {
 			Expect(dockerLog).To(ContainSubstring(podIP))
 		}
+	}
+}
+
+func testGlobalNetExternalConnectivity(f *framework.Framework) {
+	for idx := range framework.KubeClients {
+		clusterName := framework.TestContext.ClusterIDs[idx]
+
+		By(fmt.Sprintf("Creating a pod and a service in cluster %q", clusterName))
+
+		np := f.NewNetworkPod(&framework.NetworkPodConfig{
+			Type:          framework.CustomPod,
+			Port:          80,
+			Cluster:       framework.ClusterIndex(idx),
+			Scheduling:    framework.NonGatewayNode,
+			ContainerName: testContainerName,
+			ImageName:     testImage,
+			Command:       simpleHTTPServerCommand,
+		})
+		svc := np.CreateService()
+
+		// Get handle for existing docker
+		docker := framework.New(extAppName)
+
+		// Get IPs to use later
+		dockerIP := docker.GetIP(extNetName)
+		f.CreateServiceExport(np.Config.Cluster, svc.Name)
+		remoteIP := f.AwaitGlobalIngressIP(np.Config.Cluster, svc.Name, svc.Namespace)
+		Expect(remoteIP).ToNot(Equal(""))
+		podGlobalIPs := f.AwaitClusterGlobalEgressIPs(np.Config.Cluster, constants.ClusterGlobalEgressIPName)
+		Expect(len(podGlobalIPs)).ToNot(BeZero())
+		podGlobalIP := podGlobalIPs[0]
+
+		By(fmt.Sprintf("Sending an http request from external app %q to the service %q in the cluster %q",
+			dockerIP, remoteIP, clusterName))
+
+		command := []string{"curl", "-m", "10", fmt.Sprintf("%s:%d", remoteIP, 80)}
+		_, _ = docker.RunCommand(command...)
+
+		By("Verifying the pod received the request")
+
+		// TODO: fix globalnet to reserve external source IP and check the IP
+		//podLog := np.GetLog()
+
+		By(fmt.Sprintf("Sending an http request from the test pod %q %q in cluster %q to the external app %q",
+			np.Pod.Name, podGlobalIP, clusterName, dockerIP))
+
+		cmd := []string{"curl", "-m", "10", fmt.Sprintf("%s:%d", dockerIP, 80)}
+		_, _ = np.RunCommand(cmd)
+
+		By("Verifying that external app received request")
+		// Only check stderr
+		_, dockerLog := docker.GetLog()
+		Expect(dockerLog).To(ContainSubstring(podGlobalIP))
 	}
 }
 
