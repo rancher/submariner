@@ -18,6 +18,7 @@ limitations under the License.
 package framework
 
 import (
+	"context"
 	"fmt"
 	"strconv"
 
@@ -27,6 +28,14 @@ import (
 	"github.com/submariner-io/shipyard/test/e2e/tcp"
 	"github.com/submariner-io/submariner/pkg/globalnet/constants"
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/util/intstr"
+)
+
+const (
+	testAppLabel = "test-app"
 )
 
 func VerifyDatapathConnectivity(p tcp.ConnectivityTestParams, globalnetEnabled bool) {
@@ -38,6 +47,8 @@ func VerifyDatapathConnectivity(p tcp.ConnectivityTestParams, globalnetEnabled b
 }
 
 func verifyGlobalnetDatapathConnectivity(p tcp.ConnectivityTestParams) {
+	Expect(p.ToEndpointType).To(BeElementOf([]tcp.EndpointType{tcp.GlobalServiceIP, tcp.GlobalPodIP}))
+
 	if p.ConnectionTimeout == 0 {
 		p.ConnectionTimeout = framework.TestContext.ConnectionTimeout
 	}
@@ -60,10 +71,17 @@ func verifyGlobalnetDatapathConnectivity(p tcp.ConnectivityTestParams) {
 	By(fmt.Sprintf("Pointing a ClusterIP service to the listener pod in cluster %q",
 		framework.TestContext.ClusterIDs[p.ToCluster]))
 
-	service := listenerPod.CreateService()
+	var service *v1.Service
+	if p.ToEndpointType == tcp.GlobalServiceIP {
+		service = listenerPod.CreateService()
+	} else if p.ToEndpointType == tcp.GlobalPodIP {
+		service = createTCPHeadlessService(listenerPod.Config.Cluster, listenerPod.Pod.Labels[testAppLabel],
+			listenerPod.Config.Port, p.Framework.Namespace)
+	}
+
 	p.Framework.CreateServiceExport(p.ToCluster, service.Name)
 
-	remoteIP := p.Framework.AwaitGlobalIngressIP(p.ToCluster, service.Name, service.Namespace)
+	remoteIP := getGlobalIngressIP(p, service)
 	Expect(remoteIP).ToNot(Equal(""))
 
 	By(fmt.Sprintf("Creating a connector pod in cluster %q, which will attempt the specific UUID handshake over TCP",
@@ -97,13 +115,11 @@ func verifyGlobalnetDatapathConnectivity(p tcp.ConnectivityTestParams) {
 	Expect(listenerPod.TerminationMessage).To(ContainSubstring(connectorPod.Config.Data))
 	Expect(stdOut).To(ContainSubstring(listenerPod.Config.Data))
 
-	if p.ToEndpointType == tcp.GlobalIP {
-		By("Verifying the output of listener pod which must contain the globalIP assigned to the Cluster")
+	By("Verifying the output of listener pod which must contain the globalIP assigned to the Cluster")
 
-		podGlobalIP := p.Framework.AwaitClusterGlobalEgressIPs(p.FromCluster, constants.ClusterGlobalEgressIPName)
-		Expect(podGlobalIP).ToNot(Equal(""))
-		Expect(listenerPod.TerminationMessage).To(ContainSubstring(podGlobalIP[0]))
-	}
+	podGlobalIP := p.Framework.AwaitClusterGlobalEgressIPs(p.FromCluster, constants.ClusterGlobalEgressIPName)
+	Expect(podGlobalIP).ToNot(Equal(""))
+	Expect(listenerPod.TerminationMessage).To(ContainSubstring(podGlobalIP[0]))
 
 	p.Framework.DeleteService(p.ToCluster, service.Name)
 	p.Framework.DeleteServiceExport(p.ToCluster, service.Name)
@@ -124,4 +140,75 @@ func execCmdInBash(p tcp.ConnectivityTestParams, cmd []string, pod *v1.Pod) (str
 	}
 
 	return p.Framework.ExecWithOptions(execOptions, p.FromCluster)
+}
+
+func createTCPHeadlessService(cluster framework.ClusterIndex, selectorName string, port int, namespace string) *v1.Service {
+	tcpService := v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: fmt.Sprintf("test-headless-svc-%s", selectorName),
+		},
+		Spec: v1.ServiceSpec{
+			Type:      v1.ServiceTypeClusterIP,
+			ClusterIP: v1.ClusterIPNone,
+			Ports: []v1.ServicePort{{
+				Port:       int32(port),
+				Name:       "tcp",
+				TargetPort: intstr.FromInt(port),
+				Protocol:   v1.ProtocolTCP,
+			}},
+			Selector: map[string]string{
+				testAppLabel: selectorName,
+			},
+		},
+	}
+
+	services := framework.KubeClients[cluster].CoreV1().Services(namespace)
+
+	return framework.AwaitUntil("create service", func() (interface{}, error) {
+		service, err := services.Create(context.TODO(), &tcpService, metav1.CreateOptions{})
+		if errors.IsAlreadyExists(err) {
+			err = services.Delete(context.TODO(), tcpService.Name, metav1.DeleteOptions{})
+			if err != nil {
+				return nil, err
+			}
+
+			service, err = services.Create(context.TODO(), &tcpService, metav1.CreateOptions{})
+		}
+
+		return service, err
+	}, framework.NoopCheckResult).(*v1.Service)
+}
+
+func getGlobalIngressIP(p tcp.ConnectivityTestParams, service *v1.Service) string {
+	if p.ToEndpointType == tcp.GlobalServiceIP {
+		return p.Framework.AwaitGlobalIngressIP(p.ToCluster, service.Name, service.Namespace)
+	} else if p.ToEndpointType == tcp.GlobalPodIP {
+		podList := awaitPodsByLabelSelector(p.ToCluster, labels.Set(service.Spec.Selector).AsSelector().String(),
+			service.Namespace, 1)
+		ingressIPName := fmt.Sprintf("pod-%s", podList.Items[0].Name)
+		return p.Framework.AwaitGlobalIngressIP(p.ToCluster, ingressIPName, service.Namespace)
+	}
+
+	return ""
+}
+
+func awaitPodsByLabelSelector(cluster framework.ClusterIndex, labelSelector, namespace string, expectedCount int) *v1.PodList {
+	return framework.AwaitUntil("find pods for labels "+labelSelector, func() (interface{}, error) {
+		return framework.KubeClients[cluster].CoreV1().Pods(namespace).List(context.TODO(), metav1.ListOptions{
+			LabelSelector: labelSelector,
+		})
+	}, func(result interface{}) (bool, string, error) {
+		pods := result.(*v1.PodList)
+		if expectedCount >= 0 && len(pods.Items) != expectedCount {
+			return false, fmt.Sprintf("Actual pod count %d does not match the expected pod count %d", len(pods.Items), expectedCount), nil
+		}
+
+		for _, pod := range pods.Items {
+			if pod.Status.Phase != v1.PodRunning {
+				return false, fmt.Sprintf("Status for pod %q is %v", pod.Name, pod.Status.Phase), nil
+			}
+		}
+
+		return true, "", nil
+	}).(*v1.PodList)
 }
